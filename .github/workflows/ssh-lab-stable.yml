@@ -1,0 +1,182 @@
+# 零账号临时 Linux 机器（稳定版 / 端口变更可实时读到）
+#
+# 相比 ssh-lab-auto 修掉的缺陷：
+#   ssh-lab-auto 只在开头把端口上传为 artifact 一次，"持续刷新"那步只 echo 日志、没真上传。
+#   而 GitHub 的运行中日志不可读、artifact 不会中途更新 —— 隧道一换端口，本机就彻底失联。
+#
+# 本版改为：端口一变就把 conn.txt 提交回本仓库，本机用 gh api 读，永远是最新的。
+# 只在端口变化时提交，不会污染历史。
+name: ssh-lab-stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: '保持时长（分钟，1-350）'
+        required: false
+        default: '60'
+        type: string
+      pubkey:
+        description: '你的公钥（一整行 ssh-ed25519 AAAA...）'
+        required: true
+        type: string
+
+# 关键：需要写权限才能把端口提交回仓库
+permissions:
+  contents: write
+
+concurrency:
+  group: ssh-lab-stable
+  cancel-in-progress: true
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: 校验输入
+        id: v
+        env:
+          HOLD: ${{ inputs.hold_minutes }}
+          PK: ${{ inputs.pubkey }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$HOLD" | grep -Eq '^[0-9]{1,3}$'; then
+            echo "::error::hold_minutes 必须是数字"; exit 1
+          fi
+          if [ "$HOLD" -lt 1 ] || [ "$HOLD" -gt 350 ]; then
+            echo "::error::hold_minutes 必须在 1~350"; exit 1
+          fi
+          if ! printf '%s' "$PK" | grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) AAAA'; then
+            echo "::error::pubkey 格式不对"; exit 1
+          fi
+          echo "hold=$HOLD" >> "$GITHUB_OUTPUT"
+          echo "pubkey 格式校验通过"
+
+      - name: 装 sshd 并写入公钥
+        env:
+          PK: ${{ inputs.pubkey }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server >/dev/null
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$PK" > ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          printf '%s\n' \
+            'PubkeyAuthentication yes' \
+            'PasswordAuthentication no' \
+            'KbdInteractiveAuthentication no' \
+            'PermitRootLogin no' \
+            'ClientAliveInterval 30' \
+            'ClientAliveCountMax 6' \
+            | sudo tee /etc/ssh/sshd_config.d/99-lab.conf >/dev/null
+          sudo sshd -t
+          sudo systemctl restart ssh
+          sleep 2
+          sudo systemctl is-active --quiet ssh || { echo "::error::sshd 起不来"; exit 1; }
+          echo "sshd 就绪，用户 $(whoami)"
+
+      - name: 启动隧道守护进程（断线自动重建 + 端口实时回写仓库）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/tunnel-daemon.sh <<'DAEMON'
+          #!/bin/bash
+          mkdir -p /tmp/conn
+          PORTFILE=/tmp/conn/conn.txt
+          : > "$PORTFILE"
+          LAST=""
+
+          # 把端口写回仓库（只在变化时写，避免刷屏）
+          publish() {
+            local port="$1"
+            [ "$port" = "$LAST" ] && return 0
+            local body
+            body=$(printf 'host=serveo.net\nport=%s\nuser=%s\nbuilt=%s\n' \
+              "$port" "$(whoami)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+            local b64 sha
+            b64=$(printf '%s' "$body" | base64 -w0)
+            sha=$(gh api "repos/$REPO/contents/conn.txt" --jq '.sha' 2>/dev/null || true)
+            if [ -n "$sha" ]; then
+              gh api -X PUT "repos/$REPO/contents/conn.txt" \
+                -f message="port $port" -f content="$b64" -f sha="$sha" >/dev/null 2>&1 \
+                && { LAST="$port"; echo "[$(date -u +%H:%M:%S)] 已回写端口 $port"; }
+            else
+              gh api -X PUT "repos/$REPO/contents/conn.txt" \
+                -f message="port $port" -f content="$b64" >/dev/null 2>&1 \
+                && { LAST="$port"; echo "[$(date -u +%H:%M:%S)] 已创建并回写端口 $port"; }
+            fi
+          }
+
+          build() {
+            local attempt port pid
+            for attempt in $(seq 1 8); do
+              rm -f /tmp/sv.log
+              ssh -o StrictHostKeyChecking=no \
+                  -o UserKnownHostsFile=/dev/null \
+                  -o ExitOnForwardFailure=yes \
+                  -o ServerAliveInterval=15 \
+                  -o ServerAliveCountMax=3 \
+                  -o TCPKeepAlive=yes \
+                  -R 0:localhost:22 serveo.net -N -v > /tmp/sv.log 2>&1 &
+              pid=$!
+              sleep 20
+              port=$(grep -oP 'Allocated port \K[0-9]+' /tmp/sv.log | head -1 || true)
+              if [ -n "$port" ]; then
+                printf 'host=serveo.net\nport=%s\nuser=%s\nbuilt=%s\n' \
+                  "$port" "$(whoami)" "$(date -u +%H:%M:%SZ)" > "$PORTFILE"
+                echo "[$(date -u +%H:%M:%S)] 隧道就绪，端口 $port"
+                publish "$port"
+                wait $pid
+                echo "[$(date -u +%H:%M:%S)] 隧道断开，立即重建"
+              else
+                echo "[$(date -u +%H:%M:%S)] 第 $attempt 次未拿到端口"
+                kill $pid 2>/dev/null || true
+                sleep 20
+              fi
+            done
+            return 1
+          }
+
+          while true; do
+            build || true
+            sleep 3
+          done
+          DAEMON
+          chmod +x /tmp/tunnel-daemon.sh
+          nohup /tmp/tunnel-daemon.sh > /tmp/daemon.log 2>&1 &
+          echo "守护进程 PID $!"
+
+          for i in $(seq 1 24); do
+            if [ -s /tmp/conn/conn.txt ]; then
+              echo "=== 首次就绪 ==="
+              cat /tmp/conn/conn.txt
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::120 秒内没拿到端口"
+          cat /tmp/daemon.log || true
+          exit 1
+
+      - name: 保持在线
+        env:
+          HOLD: ${{ steps.v.outputs.hold }}
+        run: |
+          SECS=$(( HOLD * 60 ))
+          END=$(( $(date +%s) + SECS ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 45
+            echo "[$(date -u +%H:%M:%S)] 当前端口: $(grep -oP 'port=\K[0-9]+' /tmp/conn/conn.txt 2>/dev/null || echo '刷新中')"
+          done
+
+      - name: 收尾
+        if: always()
+        run: |
+          pkill -f tunnel-daemon 2>/dev/null || true
+          pkill -f serveo.net 2>/dev/null || true
+          echo "--- 守护日志最后 40 行 ---"
+          tail -40 /tmp/daemon.log 2>/dev/null || true
