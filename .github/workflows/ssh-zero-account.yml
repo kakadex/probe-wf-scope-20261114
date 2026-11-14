@@ -130,7 +130,17 @@ jobs:
             echo ""
             echo "> 不需要装 Tailscale、不需要注册任何账号。"
           } >> "$GITHUB_STEP_SUMMARY"
+          # 同时写一份给 artifact，方便程序读取（Summary 只能人肉看）
+          printf 'host=serveo.net\nport=%s\nuser=%s\n' "$PORT" "$USER_NAME" > /tmp/conn.txt
+          cat /tmp/conn.txt
           echo "端口 $PORT 用户 $USER_NAME"
+
+      - name: 上传连接信息为 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-conn
+          path: /tmp/conn.txt
+          retention-days: 1
 
       - name: 保持运行
         env:
