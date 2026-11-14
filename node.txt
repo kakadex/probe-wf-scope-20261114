@@ -1,0 +1,8 @@
+host=bore.pub
+port=32123
+uuid=7ca16201-c4c0-4cf4-ba2b-502603675f1d
+pbk=2vtouw8oTWkaqyjmo00rbf5IctunP8YB_QNBGISjGEA
+sid=0123456789abcdef
+sni=www.apple.com
+built=2026-11-14T01:39:16Z
+link=vless://7ca16201-c4c0-4cf4-ba2b-502603675f1d@bore.pub:32123?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.apple.com&fp=chrome&pbk=2vtouw8oTWkaqyjmo00rbf5IctunP8YB_QNBGISjGEA&sid=0123456789abcdef&type=tcp&spx=%2F#gha-node
