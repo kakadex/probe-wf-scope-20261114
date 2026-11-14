@@ -1,0 +1,186 @@
+# ---------------------------------------------------------------------------
+# phone-node —— 在 GitHub 运行器上开一个 VLESS+REALITY 节点，供手机测试
+# 触发：手动 Run workflow
+# 出口：运行器在境外机房，手机连上后出口就是这里（能真正解锁被墙站点）
+# 暴露：bore.pub 固定端口隧道（端口不变，手机随时能连）
+# 结果：节点链接写回本仓库 node.txt，用 gh api 读永远是最新的
+# ---------------------------------------------------------------------------
+name: phone-node
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'keep alive minutes (5-180)'
+        required: false
+        default: '120'
+      tunnel_port:
+        description: 'fixed public port on bore.pub (1024-65535)'
+        required: false
+        default: '32123'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phone-node
+  cancel-in-progress: true
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install xray
+        run: |
+          set -euo pipefail
+          TAG=$(curl -fsSL --max-time 40 https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -m1 '"tag_name"' | sed 's/.*: *"//;s/".*//')
+          echo "xray tag=$TAG"
+          ok=0
+          for u in \
+            "https://github.com/XTLS/Xray-core/releases/download/$TAG/Xray-linux-64.zip" \
+            "https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/download/$TAG/Xray-linux-64.zip" ; do
+            if curl -fsSL --max-time 180 -o /tmp/x.zip "$u"; then ok=1; echo "got from $u"; break; fi
+          done
+          [ "$ok" = "1" ] || { echo "::error::xray download failed"; exit 1; }
+          mkdir -p /opt/x && unzip -o /tmp/x.zip -d /opt/x >/dev/null && chmod +x /opt/x/xray
+          /opt/x/xray version | head -2
+
+      - name: install bore
+        run: |
+          set -euo pipefail
+          ok=0
+          for u in \
+            "https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-unknown-linux-musl.tar.gz" \
+            "https://gh-proxy.com/https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-unknown-linux-musl.tar.gz" ; do
+            if curl -fsSL --max-time 120 -o /tmp/bore.tgz "$u"; then ok=1; echo "got from $u"; break; fi
+          done
+          [ "$ok" = "1" ] || { echo "::error::bore download failed"; exit 1; }
+          mkdir -p /opt/bore && tar -xzf /tmp/bore.tgz -C /opt/bore && chmod +x /opt/bore/bore
+          /opt/bore/bore --version
+
+      - name: start node and publish
+        env:
+          MINUTES: ${{ inputs.minutes }}
+          TPORT: ${{ inputs.tunnel_port }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          case "$MINUTES" in ''|*[!0-9]*) echo "::error::bad minutes"; exit 1;; esac
+          case "$TPORT" in ''|*[!0-9]*) echo "::error::bad port"; exit 1;; esac
+          [ "$MINUTES" -ge 5 ] && [ "$MINUTES" -le 180 ] || { echo "::error::minutes 5-180"; exit 1; }
+          [ "$TPORT" -ge 1024 ] && [ "$TPORT" -le 65535 ] || { echo "::error::port 1024-65535"; exit 1; }
+
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          OUT=$(/opt/x/xray x25519)
+          echo "--- x25519 ---"; echo "$OUT"
+          # xray x25519 实际输出三行：
+          #   PrivateKey: xxxx
+          #   Password (PublicKey): yyyy
+          #   Hash32: zzzz
+          PRIV=$(printf '%s\n' "$OUT" | sed -n 's/^PrivateKey:[[:space:]]*//p' | tr -d ' \r' | head -1)
+          PUB=$(printf '%s\n' "$OUT" | sed -n 's/^Password (PublicKey):[[:space:]]*//p' | tr -d ' \r' | head -1)
+          echo "PRIV_LEN=${#PRIV} PUB_LEN=${#PUB}"
+          [ -n "$PRIV" ] && [ -n "$PUB" ] || { echo "::error::x25519 parse failed"; exit 1; }
+
+          SID=0123456789abcdef
+          SNI=www.apple.com
+
+          cat > /opt/x/server.json <<EOF
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [{
+              "listen": "0.0.0.0", "port": 8443, "protocol": "vless",
+              "settings": { "clients": [ { "id": "$UUID", "flow": "xtls-rprx-vision" } ], "decryption": "none" },
+              "streamSettings": {
+                "network": "tcp", "security": "reality",
+                "realitySettings": {
+                  "show": false, "dest": "$SNI:443", "xver": 0,
+                  "serverNames": ["$SNI"], "privateKey": "$PRIV", "shortIds": ["$SID"]
+                }
+              }
+            }],
+            "outbounds": [ { "protocol": "freedom" } ]
+          }
+          EOF
+
+          nohup /opt/x/xray run -c /opt/x/server.json > /tmp/xray.log 2>&1 &
+          sleep 4
+          ss -lntp | grep 8443 || { echo "::error::xray not listening"; cat /tmp/xray.log; exit 1; }
+          echo "xray listening on 8443"
+
+          # --- 建隧道：优先用指定固定端口，被别人占用则回退随机 ---
+          ACTUAL_PORT=""
+          for try in 1 2 3; do
+            nohup /opt/bore/bore local 8443 --to bore.pub --port "$TPORT" > /tmp/bore.log 2>&1 &
+            BPID=$!
+            sleep 12
+            if grep -q "listening at bore.pub:$TPORT" /tmp/bore.log 2>/dev/null; then
+              ACTUAL_PORT="$TPORT"; echo "fixed port OK: $TPORT"; break
+            fi
+            echo "--- try $try failed ---"; cat /tmp/bore.log || true
+            kill $BPID 2>/dev/null || true
+            sleep 4
+          done
+
+          if [ -z "$ACTUAL_PORT" ]; then
+            echo "fixed port unavailable, fallback to random"
+            nohup /opt/bore/bore local 8443 --to bore.pub > /tmp/bore.log 2>&1 &
+            sleep 12
+            ACTUAL_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 | cut -d: -f2)
+          fi
+          [ -n "$ACTUAL_PORT" ] || { echo "::error::tunnel failed"; cat /tmp/bore.log; exit 1; }
+          echo "=== TUNNEL PORT $ACTUAL_PORT ==="
+
+          # --- 发布节点信息到仓库 ---
+          LINK="vless://$UUID@bore.pub:$ACTUAL_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&spx=%2F#gha-node"
+          {
+            echo "host=bore.pub"
+            echo "port=$ACTUAL_PORT"
+            echo "uuid=$UUID"
+            echo "pbk=$PUB"
+            echo "sid=$SID"
+            echo "sni=$SNI"
+            echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "link=$LINK"
+          } > /tmp/node.txt
+
+          B64=$(base64 -w0 /tmp/node.txt)
+          SHA=$(gh api "repos/$REPO/contents/node.txt" --jq '.sha' 2>/dev/null || true)
+          if [ -n "$SHA" ]; then
+            gh api -X PUT "repos/$REPO/contents/node.txt" -f message="node port $ACTUAL_PORT" -f content="$B64" -f sha="$SHA" >/dev/null 2>&1 \
+              && echo "published (update)" || echo "::warning::publish update failed"
+          else
+            gh api -X PUT "repos/$REPO/contents/node.txt" -f message="node port $ACTUAL_PORT" -f content="$B64" >/dev/null 2>&1 \
+              && echo "published (create)" || echo "::warning::publish create failed"
+          fi
+
+          echo "================= NODE LINK ================="
+          echo "$LINK"
+          echo "============================================="
+
+          # --- 保持在线，隧道挂了就重建 ---
+          END=$(( $(date +%s) + MINUTES*60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 30
+            if ! pgrep -f '/opt/bore/bore local' >/dev/null; then
+              echo "[$(date -u +%H:%M:%S)] bore died, rebuilding"
+              nohup /opt/bore/bore local 8443 --to bore.pub --port "$ACTUAL_PORT" > /tmp/bore.log 2>&1 &
+              sleep 12
+              grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 || echo "rebuild may have failed"
+            fi
+            echo "[$(date -u +%H:%M:%S)] alive, port $ACTUAL_PORT"
+          done
+          echo "time up"
+
+      - name: cleanup
+        if: always()
+        run: |
+          pkill -f '/opt/bore/bore' 2>/dev/null || true
+          pkill -f '/opt/x/xray' 2>/dev/null || true
+          echo "--- bore log tail ---"; tail -20 /tmp/bore.log 2>/dev/null || true
+          echo "--- xray log tail ---"; tail -20 /tmp/xray.log 2>/dev/null || true
