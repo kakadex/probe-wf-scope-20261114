@@ -1,0 +1,157 @@
+# 零账号 SSH 通道：不需要 Tailscale、不需要注册、本机不装任何软件
+#
+# 原理：运行器主动用系统自带的 ssh 建立反向隧道到 serveo.net，
+#       本机也用系统自带的 ssh 连 serveo.net 的分配端口。
+#       两端都只用 ssh 命令，没有任何额外客户端。
+#
+# 用法：点 Run workflow，等 1 分钟，看 Summary 里的端口，然后本机 ssh -p 端口。
+name: ssh-zero-account
+
+on:
+  workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: '保持时长（分钟，1-60）'
+        required: false
+        default: '10'
+        type: string
+      pubkey:
+        description: '你的公钥（一整行 ssh-ed25519 AAAA...）'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: 校验输入
+        id: v
+        env:
+          HOLD: ${{ inputs.hold_minutes }}
+          PK: ${{ inputs.pubkey }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$HOLD" | grep -Eq '^[0-9]{1,2}$'; then
+            echo "::error::hold_minutes 必须是 1~2 位数字"; exit 1
+          fi
+          if [ "$HOLD" -lt 1 ] || [ "$HOLD" -gt 60 ]; then
+            echo "::error::hold_minutes 必须在 1~60"; exit 1
+          fi
+          if ! printf '%s' "$PK" | grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) AAAA'; then
+            echo "::error::pubkey 格式不对，应以 ssh-ed25519 AAAA 开头"
+            exit 1
+          fi
+          echo "hold=$HOLD" >> "$GITHUB_OUTPUT"
+          echo "参数校验通过"
+
+      - name: 装 sshd 并写入公钥
+        env:
+          PK: ${{ inputs.pubkey }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server >/dev/null
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$PK" > ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          printf '%s\n' \
+            'PubkeyAuthentication yes' \
+            'PasswordAuthentication no' \
+            'KbdInteractiveAuthentication no' \
+            'PermitRootLogin no' \
+            | sudo tee /etc/ssh/sshd_config.d/99-lab.conf >/dev/null
+          sudo sshd -t
+          sudo systemctl restart ssh
+          sleep 2
+          sudo systemctl is-active --quiet ssh || { echo "::error::sshd 起不来"; exit 1; }
+          echo "sshd 就绪，用户 $(whoami)"
+
+      - name: 建立 serveo 反向隧道（带重试）
+        id: tun
+        run: |
+          set -uo pipefail
+          PORT=""
+          for attempt in 1 2 3 4 5; do
+            echo "=== 第 $attempt 次尝试 ==="
+            rm -f /tmp/sv.log
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ExitOnForwardFailure=yes \
+                -o ServerAliveInterval=30 \
+                -R 0:localhost:22 serveo.net -N -v > /tmp/sv.log 2>&1 &
+            SPID=$!
+            sleep 22
+
+            PORT=$(grep -oP 'Allocated port \K[0-9]+' /tmp/sv.log | head -1 || true)
+            if [ -n "$PORT" ]; then
+              echo "✅ 第 $attempt 次成功，端口 $PORT"
+              echo "$PORT" > /tmp/port.txt
+              echo "serveo_port=$PORT" >> "$GITHUB_OUTPUT"
+              echo "$SPID" > /tmp/spid.txt
+              break
+            fi
+            echo "第 $attempt 次失败（可能是限流），30 秒后重试"
+            grep -E 'Error|failure|denied' /tmp/sv.log | head -3 || true
+            kill $SPID 2>/dev/null || true
+            sleep 30
+          done
+
+          if [ -z "$PORT" ]; then
+            echo "::error::5 次尝试都失败，serveo 不可用"
+            exit 1
+          fi
+
+      - name: 输出连接信息
+        env:
+          HOLD: ${{ steps.v.outputs.hold }}
+        run: |
+          set -euo pipefail
+          PORT=$(cat /tmp/port.txt)
+          USER_NAME=$(whoami)
+          {
+            echo "## ✅ 零账号 SSH 已就绪"
+            echo ""
+            echo "**在本机 PowerShell 执行这一行：**"
+            echo ""
+            echo '```'
+            echo "ssh -p $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL $USER_NAME@serveo.net"
+            echo '```'
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 主机 | \`serveo.net\` |"
+            echo "| 端口 | \`$PORT\` |"
+            echo "| 用户 | \`$USER_NAME\` |"
+            echo "| 保持 | $HOLD 分钟 |"
+            echo ""
+            echo "> 不需要装 Tailscale、不需要注册任何账号。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "端口 $PORT 用户 $USER_NAME"
+
+      - name: 保持运行
+        env:
+          HOLD: ${{ steps.v.outputs.hold }}
+        run: |
+          set -euo pipefail
+          # 隧道进程已在后台，这里只负责挂住
+          SECS=$(( HOLD * 60 ))
+          echo "保持 $SECS 秒..."
+          for i in $(seq 1 $HOLD); do
+            sleep 60
+            # 每分钟检查隧道还活着
+            if ! pgrep -f 'serveo.net' > /dev/null; then
+              echo "::warning::隧道进程已退出"
+            fi
+            echo "已运行 $i / $HOLD 分钟"
+          done
+          echo "时间到"
+
+      - name: 收尾
+        if: always()
+        run: |
+          pkill -f 'serveo.net' 2>/dev/null || true
+          echo "隧道已关闭"
