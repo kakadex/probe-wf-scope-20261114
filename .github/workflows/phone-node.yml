@@ -37,12 +37,12 @@ jobs:
       - name: install xray
         run: |
           set -euo pipefail
-          TAG=$(curl -fsSL --max-time 40 https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -m1 '"tag_name"' | sed 's/.*: *"//;s/".*//')
-          echo "xray tag=$TAG"
+          # 不解析 API 拿 tag：latest/download 这条地址本身会重定向到最新版
           ok=0
           for u in \
-            "https://github.com/XTLS/Xray-core/releases/download/$TAG/Xray-linux-64.zip" \
-            "https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/download/$TAG/Xray-linux-64.zip" ; do
+            "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" \
+            "https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" \
+            "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" ; do
             if curl -fsSL --max-time 180 -o /tmp/x.zip "$u"; then ok=1; echo "got from $u"; break; fi
           done
           [ "$ok" = "1" ] || { echo "::error::xray download failed"; exit 1; }
@@ -55,7 +55,8 @@ jobs:
           ok=0
           for u in \
             "https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-unknown-linux-musl.tar.gz" \
-            "https://gh-proxy.com/https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-unknown-linux-musl.tar.gz" ; do
+            "https://gh-proxy.com/https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-unknown-linux-musl.tar.gz" \
+            "https://ghfast.top/https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-unknown-linux-musl.tar.gz" ; do
             if curl -fsSL --max-time 120 -o /tmp/bore.tgz "$u"; then ok=1; echo "got from $u"; break; fi
           done
           [ "$ok" = "1" ] || { echo "::error::bore download failed"; exit 1; }
