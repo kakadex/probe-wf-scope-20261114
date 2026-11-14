@@ -1,0 +1,117 @@
+# 通道探针：在 GitHub 运行器上实测哪种"零账号"SSH 通道能用
+# 目的：如果可用，就不需要用户注册 Tailscale、不需要本机装任何东西
+name: tunnel-probe
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: 准备 sshd
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server >/dev/null
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          # 用一把探针专用公钥（对应私钥只有我们知道，本步不真登录）
+          echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID+j8Q0FaMQsn6kulYujv/nkI6k3/TvvmKbwgBmDg1es probe' > ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          printf '%s\n' 'PubkeyAuthentication yes' 'PasswordAuthentication no' 'PermitRootLogin no' \
+            | sudo tee /etc/ssh/sshd_config.d/99-probe.conf >/dev/null
+          sudo systemctl restart ssh
+          sleep 2
+          sudo systemctl is-active --quiet ssh && echo "sshd OK"
+
+      - name: 测试 serveo.net 反向隧道
+        id: serveo
+        run: |
+          set -uo pipefail
+          echo "=== 尝试 serveo（ssh 内置，无需下载）==="
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ExitOnForwardFailure=yes \
+              -R 0:localhost:22 serveo.net -N -v > /tmp/serveo.log 2>&1 &
+          SPID=$!
+          sleep 25
+
+          echo "--- serveo 日志 ---"
+          grep -E 'Allocated port|forwarding|Error|denied' /tmp/serveo.log | head -10 || true
+
+          PORT=$(grep -oP 'Allocated port \K[0-9]+' /tmp/serveo.log | head -1 || true)
+          if [ -n "$PORT" ]; then
+            echo "serveo_port=$PORT" >> "$GITHUB_OUTPUT"
+            echo "✅ serveo 分配端口: $PORT"
+            echo "serveo 结论：可用" >> /tmp/summary.txt
+          else
+            echo "serveo_port=" >> "$GITHUB_OUTPUT"
+            echo "❌ serveo 未分配端口"
+            echo "serveo 结论：不可用" >> /tmp/summary.txt
+          fi
+          kill $SPID 2>/dev/null || true
+
+      - name: 测试 bore.pub 反向隧道
+        id: bore
+        run: |
+          set -uo pipefail
+          echo "=== 下载 bore（只在运行器上，不碰用户机器）==="
+          cd /tmp
+          curl -fsSL -o bore.tar.gz https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz || {
+            echo "下载失败，试代理"
+            curl -fsSL -o bore.tar.gz "https://gh-proxy.com/https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
+          }
+          tar xzf bore.tar.gz
+          ls -l bore
+          ./bore --version || true
+
+          echo ""
+          echo "=== 启动 bore 隧道 ==="
+          ./bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
+          BPID=$!
+          sleep 20
+
+          echo "--- bore 日志 ---"
+          cat /tmp/bore.log | head -10
+
+          BPORT=$(grep -oP 'remote_port=\K[0-9]+|listening at bore\.pub:\K[0-9]+' /tmp/bore.log | head -1 || true)
+          if [ -n "$BPORT" ]; then
+            echo "bore_port=$BPORT" >> "$GITHUB_OUTPUT"
+            echo "✅ bore 分配端口: $BPORT"
+            echo "bore 结论：可用（端口 $BPORT）" >> /tmp/summary.txt
+          else
+            echo "bore_port=" >> "$GITHUB_OUTPUT"
+            echo "❌ bore 未分配端口"
+            echo "bore 结论：不可用" >> /tmp/summary.txt
+          fi
+          kill $BPID 2>/dev/null || true
+
+      - name: 自连验证（关键：能不能真的握手成功）
+        run: |
+          set -uo pipefail
+          echo "=== 用 bore 做端到端自连测试 ==="
+          cd /tmp
+          ./bore local 22 --to bore.pub > /tmp/bore2.log 2>&1 &
+          sleep 18
+          cat /tmp/bore2.log | head -5
+          P=$(grep -oP 'remote_port=\K[0-9]+' /tmp/bore2.log | head -1 || true)
+          echo "端口: $P"
+          if [ -n "$P" ]; then
+            echo "=== 从运行器自己连 bore.pub:$P ==="
+            timeout 20 ssh -p "$P" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o BatchMode=yes -o ConnectTimeout=15 runner@bore.pub 'echo TUNNEL-HANDSHAKE-OK; hostname' 2>&1 | head -5 || true
+            echo ""
+            echo "（若出现 Permission denied 但同时有 banner，说明 TCP 通了只是密钥不匹配——这已是隧道成功的证据）"
+          fi
+          pkill -f bore || true
+
+      - name: 汇总
+        if: always()
+        run: |
+          echo "## 通道探针结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/summary.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "（无摘要）" >> "$GITHUB_STEP_SUMMARY"
