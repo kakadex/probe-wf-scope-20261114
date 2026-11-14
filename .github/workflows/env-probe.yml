@@ -1,0 +1,129 @@
+# 环境探针：验证 gha-lab-vm 工作流里"未在真实 GitHub 上跑过"的那几步
+# 目的：确认 ubuntu-latest 上 sshd 能起来、Tailscale 能装、runner 用户能 sudo
+# 不进 Tailscale 网络，不需要任何 Secret
+name: env-probe
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 运行器基本信息
+        run: |
+          echo "=== 系统 ==="
+          cat /etc/os-release | head -3
+          uname -a
+          echo ""
+          echo "=== 当前用户 ==="
+          whoami
+          id
+          echo ""
+          echo "=== sudo 是否免密 ==="
+          sudo -n true && echo "sudo 免密 OK" || echo "sudo 需要密码"
+          echo ""
+          echo "=== 磁盘 ==="
+          df -h / | tail -1
+          echo ""
+          echo "=== 内存 ==="
+          free -g
+
+      - name: 验证 sshd 能否启动（README 第 4 步）
+        run: |
+          set -euo pipefail
+          echo "=== 检查是否已装 openssh-server ==="
+          dpkg -l openssh-server 2>/dev/null | tail -1 || echo "未预装"
+          echo ""
+          echo "=== apt-get 安装 ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server >/dev/null
+          echo "安装完成"
+          echo ""
+          echo "=== 写配置（与正式工作流完全一致）==="
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          printf '%s\n' \
+            'PubkeyAuthentication yes' \
+            'PasswordAuthentication no' \
+            'KbdInteractiveAuthentication no' \
+            'PermitRootLogin no' \
+            | sudo tee /etc/ssh/sshd_config.d/99-labvm.conf >/dev/null
+          echo "配置已写入"
+          echo ""
+          echo "=== 启动 sshd（与正式工作流完全一致）==="
+          sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart
+          sleep 2
+          if sudo systemctl is-active --quiet ssh; then
+            echo "✅ sshd 已启动"
+            sudo ss -tlnp | grep ':22 ' || echo "（没看到 22 端口监听，但服务是 active）"
+          else
+            echo "❌ sshd 启动失败"
+            sudo systemctl status ssh --no-pager || true
+            exit 1
+          fi
+
+      - name: 验证公钥写入与权限
+        env:
+          DUMMY_PUBKEY: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID+j8Q0FaMQsn6kulYujv/nkI6k3/TvvmKbwgBmDg1es gha-lab-vm'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DUMMY_PUBKEY" > ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          echo "=== 权限检查 ==="
+          ls -ld ~/.ssh
+          ls -l ~/.ssh/authorized_keys
+          echo ""
+          echo "=== 内容检查 ==="
+          cat ~/.ssh/authorized_keys
+          echo ""
+          echo "=== 公钥格式能被 sshd 识别吗 ==="
+          ssh-keygen -lf ~/.ssh/authorized_keys && echo "✅ 公钥格式合法"
+          echo ""
+          echo "=== 用实际配置做语法检查 ==="
+          sudo sshd -t && echo "✅ sshd 配置语法通过"
+
+      - name: 验证 Tailscale 能否安装（README 第 5 步）
+        run: |
+          set -euo pipefail
+          echo "=== 下载安装脚本 ==="
+          curl -fsSL https://tailscale.com/install.sh -o /tmp/ts-install.sh
+          echo "脚本大小: $(wc -c < /tmp/ts-install.sh) 字节"
+          head -5 /tmp/ts-install.sh
+          echo ""
+          echo "=== 执行安装 ==="
+          sh /tmp/ts-install.sh
+          echo ""
+          echo "=== 验证 tailscale 命令 ==="
+          tailscale version
+          echo ""
+          echo "=== 未登录时的状态 ==="
+          tailscale status 2>&1 | head -3 || true
+
+      - name: 验证 tailscale up 的参数是否被接受
+        run: |
+          set -euo pipefail
+          # 用一个假 key 试探参数解析，不真的上线
+          echo "=== 用假 key 试参数（预期：认证失败，但参数不被拒）==="
+          sudo timeout 25 tailscale up \
+            --authkey "tskey-auth-FAKEKEYFORTESTINGONLY000000000" \
+            --hostname "probe-node" \
+            --accept-dns=false 2>&1 | head -10 || true
+          echo ""
+          echo "（上面出现认证失败是正确的：说明参数语法都对，只是 key 是假的）"
+
+      - name: 汇总
+        if: always()
+        run: |
+          echo "## 环境探针结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 检查项 | 结果 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| sshd 安装+启动 | 见上方日志 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 公钥格式校验 | 见上方日志 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tailscale 安装 | 见上方日志 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| tailscale up 参数 | 见上方日志 |" >> "$GITHUB_STEP_SUMMARY"

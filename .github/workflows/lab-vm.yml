@@ -1,0 +1,204 @@
+# ---------------------------------------------------------------------------
+# 临时练手环境（GitHub Actions 托管运行器）
+#
+# 用途：手动开一台临时 Linux 机器，用 3~4 小时，SSH 进去练手。
+# 触发：只在 Actions 页面点 "Run workflow" 时启动，**不设定时任务**。
+# 连接：Tailscale 组网 + 标准 sshd 公钥登录（不使用 tmate）。
+#
+# 重要：运行结束后整台机器（含你装的所有东西）会被销毁，这是设计如此。
+# ---------------------------------------------------------------------------
+name: Lab VM (manual)
+
+on:
+  # 只有手动触发。刻意不写 schedule，避免变成 7x24 常驻机器。
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: '本次保留时长（分钟，1-240）'
+        required: false
+        default: '180'
+        type: string
+      device_name:
+        description: '在 Tailscale 后台显示的设备名'
+        required: false
+        default: 'gha-lab'
+        type: string
+
+# 最小权限：这个流程完全不需要 GITHUB_TOKEN 做任何事。
+permissions: {}
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    # 硬上限 250 分钟。单次任务 GitHub 绝对上限是 6 小时（360 分钟），
+    # 这里刻意压低：留 10 分钟给安装步骤，避免被系统直接砍掉。
+    timeout-minutes: 250
+
+    steps:
+      - name: 校验参数
+        id: calc
+        env:
+          INPUT_DURATION: ${{ inputs.duration_minutes }}
+          INPUT_NAME: ${{ inputs.device_name }}
+        run: |
+          set -euo pipefail
+
+          # --- 时长：必须是纯数字，防命令注入 ---
+          if ! printf '%s' "$INPUT_DURATION" | grep -Eq '^[0-9]{1,3}$'; then
+            echo "::error::duration_minutes 必须是 1~3 位纯数字，收到：$INPUT_DURATION"
+            exit 1
+          fi
+          mins=$((10#$INPUT_DURATION))
+          if [ "$mins" -lt 1 ] || [ "$mins" -gt 240 ]; then
+            echo "::error::duration_minutes 必须在 1~240 之间，收到：$mins"
+            exit 1
+          fi
+
+          # --- 设备名：只允许字母数字和连字符，避免污染 Tailscale 设备名 ---
+          if ! printf '%s' "$INPUT_NAME" | grep -Eq '^[A-Za-z0-9-]{1,32}$'; then
+            echo "::error::device_name 只允许字母、数字、连字符，长度 1~32，收到：$INPUT_NAME"
+            exit 1
+          fi
+
+          echo "sleep_seconds=$(( mins * 60 ))" >> "$GITHUB_OUTPUT"
+          echo "device_name=$INPUT_NAME" >> "$GITHUB_OUTPUT"
+          echo "本次申请保留 ${mins} 分钟，设备名 ${INPUT_NAME}"
+
+      - name: 校验必填 Secret
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+        run: |
+          set -euo pipefail
+          fail=0
+
+          if [ -z "${TS_AUTHKEY:-}" ]; then
+            echo "::error::缺少 Secret：TS_AUTHKEY（Tailscale 后台生成的 auth key）"
+            fail=1
+          fi
+
+          if [ -z "${SSH_PUBKEY:-}" ]; then
+            echo "::error::缺少 Secret：SSH_PUBKEY（你本机的公钥，ssh-ed25519 AAAA... 开头）"
+            fail=1
+          else
+            # 只接受公钥格式，防止误粘私钥或别的文本
+            if ! printf '%s' "$SSH_PUBKEY" | grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) AAAA'; then
+              echo "::error::SSH_PUBKEY 格式不对，应以 ssh-ed25519 / ssh-rsa / ecdsa- 开头"
+              fail=1
+            fi
+            # 防止有人在里面塞多行（每行都变一条授权）
+            if [ "$(printf '%s' "$SSH_PUBKEY" | wc -l)" -gt 0 ]; then
+              echo "::error::SSH_PUBKEY 必须是单行"
+              fail=1
+            fi
+          fi
+
+          [ "$fail" -eq 0 ] || exit 1
+          echo "两个 Secret 都已配置且格式正确"
+
+      - name: 写入 SSH 公钥
+        env:
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+        run: |
+          set -euo pipefail
+          # 复用运行器自带的 runner 用户，不新建账号、不设密码。
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PUBKEY" > ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          echo "公钥已写入 $(whoami) 账号"
+
+      - name: 启动 sshd
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server >/dev/null
+
+          # 只允许公钥登录，禁用密码（runner 用户本来也没有已知密码）
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          printf '%s\n' \
+            'PubkeyAuthentication yes' \
+            'PasswordAuthentication no' \
+            'KbdInteractiveAuthentication no' \
+            'PermitRootLogin no' \
+            | sudo tee /etc/ssh/sshd_config.d/99-labvm.conf >/dev/null
+
+          sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart
+          sleep 2
+          sudo systemctl is-active --quiet ssh && echo "sshd 已启动" || { echo "::error::sshd 启动失败"; exit 1; }
+
+      - name: 加入 Tailscale 网络
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          DEVICE_NAME: ${{ steps.calc.outputs.device_name }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          # 注意：不启用 --ssh。这里用标准 sshd 而不是 Tailscale SSH，
+          # 因为 Tailscale SSH 还依赖后台 ACL 策略，多一层配置就多一个失败点。
+          sudo tailscale up \
+            --authkey "$TS_AUTHKEY" \
+            --hostname "$DEVICE_NAME" \
+            --accept-dns=false
+
+          echo "Tailscale 已上线"
+          tailscale ip -4
+
+      - name: 输出连接信息
+        env:
+          DEVICE_NAME: ${{ steps.calc.outputs.device_name }}
+          DURATION: ${{ inputs.duration_minutes }}
+        run: |
+          set -euo pipefail
+          ip="$(tailscale ip -4 | head -n1)"
+          user="$(whoami)"
+
+          {
+            echo "## 临时环境已就绪"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| Tailscale 地址 | \`$ip\` |"
+            echo "| 设备名 | \`$DEVICE_NAME\` |"
+            echo "| 登录用户 | \`$user\` |"
+            echo "| 计划保留 | $DURATION 分钟 |"
+            echo ""
+            echo "在本机执行："
+            echo ""
+            echo '```powershell'
+            echo "ssh $user@$ip"
+            echo '```'
+            echo ""
+            echo "> 要提前结束：回 Actions 页面点 **Cancel workflow**。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "=========================================="
+          echo " Tailscale IP : $ip"
+          echo " SSH 登录     : ssh $user@$ip"
+          echo "=========================================="
+
+      - name: 保持运行（倒计时自动结束）
+        env:
+          SLEEP_SECONDS: ${{ steps.calc.outputs.sleep_seconds }}
+        run: |
+          set -euo pipefail
+          # 二次校验：即使上游被绕过，这里也拒绝非纯数字。
+          case "$SLEEP_SECONDS" in
+            ''|*[!0-9]*)
+              echo "::error::sleep_seconds 不是纯数字：$SLEEP_SECONDS"
+              exit 1
+              ;;
+          esac
+          mins=$(( SLEEP_SECONDS / 60 ))
+          echo "机器将保持运行 $SLEEP_SECONDS 秒（约 $mins 分钟）。"
+          echo "要提前结束：到 Actions 页面点 Cancel workflow。"
+          sleep "$SLEEP_SECONDS"
+          echo "时间到，本次临时环境即将销毁。"
+
+      - name: 收尾（无论成功失败都执行）
+        if: always()
+        run: |
+          # 把设备从 Tailscale 后台移除，不留影子设备
+          sudo tailscale logout 2>/dev/null || true
+          echo "已退出 Tailscale 网络，设备将从后台消失。"
